@@ -68,16 +68,17 @@ type HourPoint struct {
 }
 
 type DashboardItem struct {
-	ID       string   `json:"id"`
-	Name     string   `json:"name"`
-	Currency string   `json:"currency"`
-	TimeZone int      `json:"time_zone"`
-	Spent    float64  `json:"spent"`
-	Revenue  float64  `json:"revenue"`
-	Profit   float64  `json:"profit"`
-	ROAS     *float64 `json:"roas,omitempty"`
-	Status   string   `json:"status"`
-	Error    *string  `json:"error,omitempty"`
+	ID         string   `json:"id"`
+	Name       string   `json:"name"`
+	Currency   string   `json:"currency"`
+	TimeZone   int      `json:"time_zone"`
+	Spent      float64  `json:"spent"`
+	Revenue    float64  `json:"revenue"`
+	NetRevenue float64  `json:"net_revenue"`
+	Profit     float64  `json:"profit"`
+	ROAS       *float64 `json:"roas,omitempty"`
+	Status     string   `json:"status"`
+	Error      *string  `json:"error,omitempty"`
 }
 
 // ──────────────────────────────────────────────
@@ -736,10 +737,11 @@ func AggregateDashboardSummaries(inputs []DashboardSummaryInput, date string) Ca
 			continue
 		}
 
-		// Existing per-dashboard totals (divide by 100 for backward compat).
-		item.Spent = summary.Ads.Spent / 100
-		item.Revenue = summary.Commissions.Gross / 100
-		item.Profit = summary.Analytics.Profit / 100
+		// Per-dashboard totals in cents (frontend divides via formatCurrencyBRL).
+		item.Spent = summary.Ads.Spent
+		item.Revenue = summary.Commissions.Gross
+		item.NetRevenue = summary.Commissions.Net
+		item.Profit = summary.Analytics.Profit
 		if summary.Analytics.ROAS != nil {
 			item.ROAS = summary.Analytics.ROAS
 		} else {
