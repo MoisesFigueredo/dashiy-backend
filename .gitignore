@@ -1,0 +1,6 @@
+.env
+/bin
+/tmp
+/coverage.out
+*.exe
+.codex-logs/
