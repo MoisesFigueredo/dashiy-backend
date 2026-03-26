@@ -596,8 +596,29 @@ func (s *Scheduler) syncAdObjects(ctx context.Context) {
 	)
 }
 
+// deduplicateAdObjects removes duplicate ad objects by ID, keeping the last occurrence.
+func deduplicateAdObjects(objects []utmify.AdObject) []utmify.AdObject {
+	seen := make(map[string]int, len(objects))
+	deduped := make([]utmify.AdObject, 0, len(objects))
+	for _, obj := range objects {
+		key := strings.TrimSpace(obj.ID)
+		if key == "" {
+			deduped = append(deduped, obj)
+			continue
+		}
+		if idx, exists := seen[key]; exists {
+			deduped[idx] = obj // overwrite with latest
+		} else {
+			seen[key] = len(deduped)
+			deduped = append(deduped, obj)
+		}
+	}
+	return deduped
+}
+
 // upsertAdObjectSnapshot persists a dashboard's ad objects for a level+date to PostgreSQL.
 func (s *Scheduler) upsertAdObjectSnapshot(ctx context.Context, dashboard utmify.Dashboard, level, date string, objects []utmify.AdObject) error {
+	objects = deduplicateAdObjects(objects)
 	rawJSON, err := json.Marshal(objects)
 	if err != nil {
 		return fmt.Errorf("marshal ad objects: %w", err)

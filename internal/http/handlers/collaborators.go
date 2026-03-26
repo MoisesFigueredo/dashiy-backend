@@ -522,12 +522,17 @@ func (h *CollaboratorsHandler) MonthlyCommissions(c *fiber.Ctx) error {
 	rows, err := h.db.Query(c.Context(), `
 		SELECT
 			ce.role,
-			ce.ad_id,
+			(array_agg(ce.ad_id ORDER BY ce.snapshot_date DESC))[1] AS ad_id,
 			a.name,
 			COALESCE(a.name_parsed->>'offer_code', '') AS offer_code,
-			COALESCE(o.name, a.name_parsed->>'offer_code', '') AS offer_name,
-			COALESCE(ud.currency, 'BRL') AS currency,
-			COUNT(*) AS snapshot_days,
+			COALESCE(MAX(o.name), MAX(a.name_parsed->>'offer_code'), '') AS offer_name,
+			COALESCE(
+				(SELECT ud2.currency FROM utmify_dashboards ud2
+				 WHERE ud2.company_id = a.company_id AND ud2.niche_id = a.niche_id
+				 LIMIT 1),
+				'BRL'
+			) AS currency,
+			COUNT(DISTINCT ce.snapshot_date) AS snapshot_days,
 			COALESCE(SUM(ce.revenue_amount), 0) AS revenue_amount,
 			COALESCE(SUM(ce.spend_amount), 0) AS spend_amount,
 			COALESCE(SUM(ce.base_amount), 0) AS profit_amount,
@@ -540,16 +545,18 @@ func (h *CollaboratorsHandler) MonthlyCommissions(c *fiber.Ctx) error {
 			ON o.company_id = a.company_id
 		   AND o.niche_id = a.niche_id
 		   AND o.code = COALESCE(a.name_parsed->>'offer_code', '')
-		LEFT JOIN utmify_dashboards ud
-			ON ud.company_id = a.company_id
-		   AND ud.niche_id = a.niche_id
 		WHERE ce.company_id = $1
 		  AND ce.user_id = $2
 		  AND ce.source_type = 'ad_snapshot'
 		  AND ce.snapshot_date >= $3
 		  AND ce.snapshot_date < $4
-		  AND ($5 = '' OR ud.external_id = $5)
-		GROUP BY ce.role, ce.ad_id, a.name, offer_code, offer_name, currency
+		  AND ($5 = '' OR EXISTS (
+		      SELECT 1 FROM utmify_dashboards ud
+		      WHERE ud.company_id = a.company_id
+		        AND ud.niche_id = a.niche_id
+		        AND ud.external_id = $5
+		  ))
+		GROUP BY ce.role, a.name, COALESCE(a.name_parsed->>'offer_code', ''), a.company_id, a.niche_id
 		ORDER BY commission_amount DESC, a.name ASC
 	`, scope.CompanyID, userID, monthStart, monthEnd, dashboardFilter)
 	if err != nil {
