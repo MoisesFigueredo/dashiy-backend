@@ -71,7 +71,7 @@ func Load() (Config, error) {
 		App: AppConfig{
 			Name:        getEnv("APP_NAME", "metricas-financeiro-api"),
 			Env:         getEnv("APP_ENV", "development"),
-			Port:        getEnv("APP_PORT", "8080"),
+			Port:        getEnvFirstOf([]string{"APP_PORT", "PORT"}, "8080"),
 			LogLevel:    getEnv("LOG_LEVEL", "info"),
 			CorsOrigins: getEnv("CORS_ORIGINS", "http://localhost:8080,http://127.0.0.1:8080,http://localhost:5173,http://127.0.0.1:5173"),
 		},
@@ -123,6 +123,15 @@ func Load() (Config, error) {
 func loadDotEnv() {
 	// Best-effort load so local commands work without manually exporting vars.
 	_ = godotenv.Load(".env", ".env.local", filepath.Join("..", "dashiy-front", ".env"))
+}
+
+func getEnvFirstOf(keys []string, fallback string) string {
+	for _, key := range keys {
+		if value := os.Getenv(key); value != "" {
+			return value
+		}
+	}
+	return fallback
 }
 
 func getEnv(key, fallback string) string {
