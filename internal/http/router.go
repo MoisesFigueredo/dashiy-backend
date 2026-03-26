@@ -109,6 +109,7 @@ func NewRouter(deps Dependencies) *fiber.App {
 		company.Get("/ads/objects", adObjectsHandler.List)
 	}
 
+	registerRoutes(app)
 	registerRoutes(app.Group("/api"))
 	registerRoutes(app.Group("/api/v1"))
 
