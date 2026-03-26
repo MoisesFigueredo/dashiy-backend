@@ -580,12 +580,12 @@ func (s *Service) findCollaboratorsByCodes(ctx context.Context, tx pgx.Tx, compa
 	}
 
 	rows, err := tx.Query(ctx, `
-		SELECT id, name, code, role, commission_rate_min, commission_rate_max
-		FROM collaborators
+		SELECT id, full_name, COALESCE(code, ''), role, commission_rate_min, commission_rate_max
+		FROM users
 		WHERE company_id = $1
 		  AND status = 'active'
 		  AND code = ANY($2::text[])
-		ORDER BY name
+		ORDER BY full_name
 	`, companyID, filtered)
 	if err != nil {
 		return nil, fmt.Errorf("query collaborators by code: %w", err)
@@ -615,12 +615,11 @@ func (s *Service) upsertAdCollaborator(ctx context.Context, tx pgx.Tx, companyID
 			niche_id,
 			ad_id,
 			user_id,
-			collaborator_id,
 			role,
 			commission_pct_min,
 			commission_pct_max
-		) VALUES ($1, $2, $3, NULL, $4, $5, $6, $7)
-		ON CONFLICT (ad_id, collaborator_id, role) WHERE collaborator_id IS NOT NULL
+		) VALUES ($1, $2, $3, $4, $5, $6, $7)
+		ON CONFLICT (ad_id, user_id, role)
 		DO UPDATE SET
 			commission_pct_min = EXCLUDED.commission_pct_min,
 			commission_pct_max = EXCLUDED.commission_pct_max,
@@ -675,7 +674,6 @@ func (s *Service) upsertCommissionEntry(
 			commission_value,
 			status,
 			adjustment_reason,
-			collaborator_id,
 			ad_id,
 			snapshot_date,
 			revenue_amount,
@@ -684,13 +682,13 @@ func (s *Service) upsertCommissionEntry(
 			source_type,
 			metadata
 		) VALUES (
-			$1, $2, NULL, NULL, NULL, $3, $4, $5, $6, 'pending', $7, $8, $9, $10, $11, $12, $13, 'ad_snapshot', $14::jsonb
+			$1, $2, NULL, $8, NULL, $3, $4, $5, $6, 'pending', $7, $9, $10, $11, $12, $13, 'ad_snapshot', $14::jsonb
 		)
-		ON CONFLICT (ad_id, snapshot_date, collaborator_id, role, source_type)
+		ON CONFLICT (ad_id, snapshot_date, user_id, role, source_type)
 			WHERE source_type = 'ad_snapshot'
 			  AND ad_id IS NOT NULL
 			  AND snapshot_date IS NOT NULL
-			  AND collaborator_id IS NOT NULL
+			  AND user_id IS NOT NULL
 		DO UPDATE SET
 			base_amount = EXCLUDED.base_amount,
 			commission_pct = EXCLUDED.commission_pct,
@@ -776,6 +774,115 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+// LinkCollaboratorToAds scans all existing ads whose parsed name references the
+// given collaborator code and creates the missing ad_collaborators and
+// commission_entries rows. This is called right after a new collaborator is
+// created so that historical data is linked without requiring a full re-sync.
+func (s *Service) LinkCollaboratorToAds(ctx context.Context, companyID uuid.UUID, collabID uuid.UUID, code string, commissionRateMin decimal.Decimal, commissionRateMax decimal.Decimal) error {
+	normalizedCode := strings.ToUpper(strings.TrimSpace(code))
+	if normalizedCode == "" {
+		return nil
+	}
+
+	tx, err := s.db.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return fmt.Errorf("begin link collaborator tx: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	// 1. Create ad_collaborators for every ad that references this code.
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO ad_collaborators (company_id, niche_id, ad_id, user_id, role, commission_pct_min, commission_pct_max)
+		SELECT a.company_id, a.niche_id, a.id, $2,
+			CASE
+				WHEN upper(a.name_parsed->>'copy_code') = $3 THEN 'copywriter'
+				WHEN upper(a.name_parsed->>'editor_code') = $3 THEN 'editor'
+			END,
+			$4, $5
+		FROM ads a
+		WHERE a.company_id = $1
+		  AND (
+			upper(a.name_parsed->>'copy_code') = $3
+			OR upper(a.name_parsed->>'editor_code') = $3
+		  )
+		ON CONFLICT (ad_id, user_id, role)
+		DO UPDATE SET
+			commission_pct_min = EXCLUDED.commission_pct_min,
+			commission_pct_max = EXCLUDED.commission_pct_max,
+			updated_at = now()
+	`, companyID, collabID, normalizedCode, commissionRateMin, commissionRateMax); err != nil {
+		return fmt.Errorf("bulk upsert ad_collaborators for %s: %w", normalizedCode, err)
+	}
+
+	// 2. Create commission_entries for every existing snapshot of those ads.
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO commission_entries (
+			company_id, niche_id, transaction_id, user_id, commission_period_id,
+			role, base_amount, commission_pct, commission_value, status,
+			adjustment_reason, ad_id, snapshot_date,
+			revenue_amount, spend_amount, chargeback_amount, source_type, metadata
+		)
+		SELECT
+			a.company_id,
+			a.niche_id,
+			NULL,
+			$2,
+			NULL,
+			CASE
+				WHEN upper(a.name_parsed->>'copy_code') = $3 THEN 'copywriter'
+				WHEN upper(a.name_parsed->>'editor_code') = $3 THEN 'editor'
+			END,
+			GREATEST(s.revenue - s.spend + COALESCE(s.chargeback_amount, 0), 0),
+			$4,
+			CASE
+				WHEN (s.revenue - s.spend + COALESCE(s.chargeback_amount, 0)) > 0 AND $4 > 0
+				THEN (s.revenue - s.spend + COALESCE(s.chargeback_amount, 0)) * $4 / 100
+				ELSE 0
+			END,
+			'pending',
+			'collaborator_backfill',
+			a.id,
+			s.snapshot_date,
+			s.revenue,
+			s.spend,
+			COALESCE(s.chargeback_amount, 0),
+			'ad_snapshot',
+			jsonb_build_object(
+				'offer_code', COALESCE(a.name_parsed->>'offer_code', ''),
+				'ad_name', a.name,
+				'backfill', true
+			)
+		FROM ads a
+		INNER JOIN ad_metric_snapshots s
+			ON s.ad_id = a.id
+		WHERE a.company_id = $1
+		  AND (
+			upper(a.name_parsed->>'copy_code') = $3
+			OR upper(a.name_parsed->>'editor_code') = $3
+		  )
+		ON CONFLICT (ad_id, snapshot_date, user_id, role, source_type)
+			WHERE source_type = 'ad_snapshot'
+			  AND ad_id IS NOT NULL
+			  AND snapshot_date IS NOT NULL
+			  AND user_id IS NOT NULL
+		DO NOTHING
+	`, companyID, collabID, normalizedCode, commissionRateMin); err != nil {
+		return fmt.Errorf("bulk insert commission_entries for %s: %w", normalizedCode, err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit link collaborator tx: %w", err)
+	}
+
+	s.logger.Info("linked collaborator to existing ads",
+		slog.String("company_id", companyID.String()),
+		slog.String("user_id", collabID.String()),
+		slog.String("code", normalizedCode),
+	)
+
+	return nil
 }
 
 func extractChargebackAmount(rawPayload []byte) decimal.Decimal {

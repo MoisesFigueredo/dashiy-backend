@@ -11,7 +11,6 @@ import (
 	"github.com/canal/metricas-financeiro-app/backend/internal/utmify"
 	"github.com/canal/metricas-financeiro-app/backend/internal/workers"
 	"github.com/gofiber/fiber/v2"
-	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -32,6 +31,7 @@ func (h *AdObjectsHandler) List(c *fiber.Ctx) error {
 	level := strings.TrimSpace(c.Query("level", "account"))
 	date := strings.TrimSpace(c.Query("date"))
 	dashboardID := strings.TrimSpace(c.Query("dashboard"))
+	scope := middleware.GetCompanyContext(c)
 
 	if date == "" {
 		date = time.Now().UTC().Format("2006-01-02")
@@ -43,6 +43,13 @@ func (h *AdObjectsHandler) List(c *fiber.Ctx) error {
 
 	// If a specific dashboard is requested, try DB for that dashboard.
 	if dashboardID != "" {
+		dashboards, err := loadAccessibleDashboards(c.Context(), h.db, scope)
+		if err != nil {
+			return fiber.NewError(fiber.StatusInternalServerError, "failed to load company dashboards")
+		}
+		if _, ok := filterDashboardsByID(dashboards, dashboardID); !ok {
+			return fiber.NewError(fiber.StatusNotFound, "dashboard not found")
+		}
 		return h.listByDashboard(c, dashboardID, level, date)
 	}
 
@@ -87,22 +94,27 @@ func (h *AdObjectsHandler) listByDashboard(c *fiber.Ctx, dashboardID, level, dat
 func (h *AdObjectsHandler) listByCompany(c *fiber.Ctx, level, date string) error {
 	scope := middleware.GetCompanyContext(c)
 
-	// Look up which dashboards belong to this company.
-	externalIDs, err := h.getCompanyDashboardIDs(c.Context(), scope.CompanyID)
+	// Look up which dashboards the current user is allowed to access.
+	dashboards, err := loadAccessibleDashboards(c.Context(), h.db, scope)
 	if err != nil {
 		return fiber.NewError(fiber.StatusInternalServerError, "failed to load company dashboards")
 	}
 
 	// No registered dashboards — fall back to global DB data.
-	if len(externalIDs) == 0 {
-		return h.listAllFallback(c, level, date)
+	if len(dashboards) == 0 {
+		return c.JSON(workers.CachedAllAdObjects{
+			Level:      level,
+			Date:       date,
+			Dashboards: []workers.CachedAdObjects{},
+			CachedAt:   time.Now().UTC().Format(time.RFC3339),
+		})
 	}
 
 	// Collect per-dashboard ad objects from DB (primary) or MCP (fallback).
-	allDashboards := make([]workers.CachedAdObjects, 0, len(externalIDs))
-	for _, extID := range externalIDs {
+	allDashboards := make([]workers.CachedAdObjects, 0, len(dashboards))
+	for _, dashboard := range dashboards {
 		// Try DB first.
-		cached, err := h.loadAdObjectsFromDB(c.Context(), extID, level, date)
+		cached, err := h.loadAdObjectsFromDB(c.Context(), dashboard.ExternalID, level, date)
 		if err == nil && cached != nil {
 			allDashboards = append(allDashboards, *cached)
 			continue
@@ -111,7 +123,7 @@ func (h *AdObjectsHandler) listByCompany(c *fiber.Ctx, level, date string) error
 		// Try Redis cache.
 		if h.cache != nil {
 			var redisCached workers.CachedAdObjects
-			key := cache.AdObjectsKey(extID, level, date)
+			key := cache.AdObjectsKey(dashboard.ExternalID, level, date)
 			found, err := h.cache.Get(c.Context(), key, &redisCached)
 			if err == nil && found {
 				allDashboards = append(allDashboards, redisCached)
@@ -120,15 +132,17 @@ func (h *AdObjectsHandler) listByCompany(c *fiber.Ctx, level, date string) error
 		}
 
 		// DB + cache miss — fetch live from MCP.
-		objects, err := h.client.GetMetaAdObjects(c.Context(), extID, level, date, date)
+		objects, err := h.client.GetMetaAdObjects(c.Context(), dashboard.ExternalID, level, date, date)
 		if err != nil {
 			continue // skip this dashboard
 		}
 		allDashboards = append(allDashboards, workers.CachedAdObjects{
-			DashboardID: extID,
-			Level:       level,
-			Date:        date,
-			Objects:     objects,
+			DashboardID:   dashboard.ExternalID,
+			DashboardName: dashboard.Name,
+			Currency:      dashboard.Currency,
+			Level:         level,
+			Date:          date,
+			Objects:       objects,
 		})
 	}
 
@@ -173,30 +187,6 @@ func (h *AdObjectsHandler) loadAdObjectsFromDB(ctx context.Context, dashboardID,
 		Objects:       objects,
 		CachedAt:      fetchedAt.Format(time.RFC3339),
 	}, nil
-}
-
-// getCompanyDashboardIDs returns the external MCP dashboard IDs for a company.
-func (h *AdObjectsHandler) getCompanyDashboardIDs(ctx context.Context, companyID uuid.UUID) ([]string, error) {
-	rows, err := h.db.Query(ctx, `
-		SELECT external_id
-		FROM utmify_dashboards
-		WHERE company_id = $1 AND active = true
-		ORDER BY name
-	`, companyID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var ids []string
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			return nil, err
-		}
-		ids = append(ids, id)
-	}
-	return ids, rows.Err()
 }
 
 // listAllFallback uses DB data for all dashboards (when no utmify_dashboards

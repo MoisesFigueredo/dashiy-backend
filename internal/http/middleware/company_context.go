@@ -11,10 +11,11 @@ import (
 const companyContextKey = "company_context"
 
 type CompanyContext struct {
-	CompanyID uuid.UUID  `json:"company_id"`
-	NicheID   *uuid.UUID `json:"niche_id,omitempty"`
-	UserID    *uuid.UUID `json:"user_id,omitempty"`
-	Role      string     `json:"role,omitempty"`
+	CompanyID      uuid.UUID  `json:"company_id"`
+	NicheID        *uuid.UUID `json:"niche_id,omitempty"`
+	UserID         *uuid.UUID `json:"user_id,omitempty"`
+	Role           string     `json:"role,omitempty"`
+	IsCollaborator bool       `json:"is_collaborator,omitempty"`
 }
 
 func RequireCompanyContext(authService *auth.Service) fiber.Handler {
@@ -45,6 +46,8 @@ func RequireCompanyContext(authService *auth.Service) fiber.Handler {
 				}
 				ctx.UserID = &userID
 			}
+
+			ctx.IsCollaborator = isCollaboratorRole(ctx.Role)
 
 			if nicheID, err := parseOptionalUUIDValue(c, "X-Niche-ID", "niche_id"); err == nil {
 				ctx.NicheID = nicheID
@@ -78,6 +81,8 @@ func RequireCompanyContext(authService *auth.Service) fiber.Handler {
 			return fiber.NewError(fiber.StatusBadRequest, "invalid user context")
 		}
 
+		ctx.IsCollaborator = isCollaboratorRole(ctx.Role)
+
 		c.Locals(companyContextKey, ctx)
 		return c.Next()
 	}
@@ -108,6 +113,27 @@ func parseOptionalUUIDValue(c *fiber.Ctx, headerKey string, queryKey string) (*u
 	}
 
 	return &id, nil
+}
+
+func isCollaboratorRole(role string) bool {
+	switch strings.ToLower(strings.TrimSpace(role)) {
+	case "copywriter", "editor", "closer":
+		return true
+	default:
+		return false
+	}
+}
+
+// RequireAdmin rejects the request if the current user is a collaborator.
+// Must be used after RequireCompanyContext.
+func RequireAdmin() fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		scope := GetCompanyContext(c)
+		if scope.IsCollaborator {
+			return fiber.NewError(fiber.StatusForbidden, "admin access required")
+		}
+		return c.Next()
+	}
 }
 
 func firstNonEmpty(values ...string) string {

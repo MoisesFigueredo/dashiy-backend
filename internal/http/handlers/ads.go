@@ -67,20 +67,20 @@ func (h *AdsHandler) List(c *fiber.Ctx) error {
 			ON ud.company_id = a.company_id
 		   AND ud.niche_id = a.niche_id
 		LEFT JOIN LATERAL (
-			SELECT c.name, c.code
+			SELECT u.full_name AS name, COALESCE(u.code, '') AS code
 			FROM ad_collaborators ac
-			INNER JOIN collaborators c
-				ON c.id = ac.collaborator_id
+			INNER JOIN users u
+				ON u.id = ac.user_id
 			WHERE ac.ad_id = a.id
 			  AND ac.role = 'copywriter'
 			ORDER BY ac.updated_at DESC
 			LIMIT 1
 		) AS copy_collab ON TRUE
 		LEFT JOIN LATERAL (
-			SELECT c.name, c.code
+			SELECT u.full_name AS name, COALESCE(u.code, '') AS code
 			FROM ad_collaborators ac
-			INNER JOIN collaborators c
-				ON c.id = ac.collaborator_id
+			INNER JOIN users u
+				ON u.id = ac.user_id
 			WHERE ac.ad_id = a.id
 			  AND ac.role = 'editor'
 			ORDER BY ac.updated_at DESC

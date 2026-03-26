@@ -24,7 +24,6 @@ type TokenClaims struct {
 	FullName    string      `json:"full_name,omitempty"`
 	CompanyID   string      `json:"company_id,omitempty"`
 	CompanyName string      `json:"company_name,omitempty"`
-	CompanySlug string      `json:"company_slug,omitempty"`
 	Role        string      `json:"role,omitempty"`
 	Plan        string      `json:"plan,omitempty"`
 	IssuedAt    int64       `json:"iat"`

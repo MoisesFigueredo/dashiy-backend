@@ -25,8 +25,6 @@ var (
 	ErrSystemBootstrapClosed = errors.New("system bootstrap already completed")
 )
 
-var nonSlugChars = regexp.MustCompile(`[^a-z0-9]+`)
-
 type Service struct {
 	db        *pgxpool.Pool
 	jwtSecret string
@@ -53,7 +51,6 @@ type SystemUserSession struct {
 type CompanySession struct {
 	ID     string `json:"id"`
 	Name   string `json:"name"`
-	Slug   string `json:"slug"`
 	Plan   string `json:"plan"`
 	Active bool   `json:"active"`
 }
@@ -220,10 +217,9 @@ func (s *Service) LoginSystem(ctx context.Context, email string, password string
 	return s.issueSystemSession(userID, email)
 }
 
-func (s *Service) LoginCompanyAdmin(ctx context.Context, companySlug string, email string, password string) (SessionResponse, error) {
-	companySlug = normalizeSlug(companySlug)
+func (s *Service) LoginCompanyUser(ctx context.Context, email string, password string) (SessionResponse, error) {
 	email = normalizeEmail(email)
-	if companySlug == "" || email == "" {
+	if email == "" {
 		return SessionResponse{}, ErrInvalidCredentials
 	}
 
@@ -235,8 +231,8 @@ func (s *Service) LoginCompanyAdmin(ctx context.Context, companySlug string, ema
 		PasswordHash  string
 		Role          string
 		UserActive    bool
+		UserStatus    string
 		CompanyName   string
-		CompanySlug   string
 		CompanyPlan   string
 		CompanyActive bool
 	}
@@ -251,18 +247,17 @@ func (s *Service) LoginCompanyAdmin(ctx context.Context, companySlug string, ema
 			COALESCE(u.password_hash, ''),
 			u.role,
 			u.active,
+			u.status,
 			c.name,
-			c.slug,
 			c.plan,
 			c.active
 		FROM users u
 		INNER JOIN companies c
 			ON c.id = u.company_id
 		WHERE lower(u.email) = lower($1)
-			AND lower(c.slug) = lower($2)
 			AND c.deleted_at IS NULL
 		LIMIT 1
-	`, email, companySlug).Scan(
+	`, email).Scan(
 		&record.UserID,
 		&record.CompanyID,
 		&record.FullName,
@@ -270,8 +265,8 @@ func (s *Service) LoginCompanyAdmin(ctx context.Context, companySlug string, ema
 		&record.PasswordHash,
 		&record.Role,
 		&record.UserActive,
+		&record.UserStatus,
 		&record.CompanyName,
-		&record.CompanySlug,
 		&record.CompanyPlan,
 		&record.CompanyActive,
 	)
@@ -282,7 +277,7 @@ func (s *Service) LoginCompanyAdmin(ctx context.Context, companySlug string, ema
 		return SessionResponse{}, fmt.Errorf("find company user: %w", err)
 	}
 
-	if !record.CompanyActive || !record.UserActive || record.Role != "admin" || record.PasswordHash == "" || ComparePassword(record.PasswordHash, password) != nil {
+	if !record.CompanyActive || !record.UserActive || record.UserStatus != "active" || record.PasswordHash == "" || ComparePassword(record.PasswordHash, password) != nil {
 		return SessionResponse{}, ErrInvalidCredentials
 	}
 
@@ -302,7 +297,6 @@ func (s *Service) LoginCompanyAdmin(ctx context.Context, companySlug string, ema
 		FullName:    record.FullName,
 		CompanyID:   record.CompanyID.String(),
 		CompanyName: record.CompanyName,
-		CompanySlug: record.CompanySlug,
 		Role:        record.Role,
 		Plan:        record.CompanyPlan,
 		IssuedAt:    now.Unix(),
@@ -320,7 +314,6 @@ func (s *Service) LoginCompanyAdmin(ctx context.Context, companySlug string, ema
 		Company: &CompanySession{
 			ID:     record.CompanyID.String(),
 			Name:   record.CompanyName,
-			Slug:   record.CompanySlug,
 			Plan:   record.CompanyPlan,
 			Active: record.CompanyActive,
 		},
@@ -334,6 +327,61 @@ func (s *Service) LoginCompanyAdmin(ctx context.Context, companySlug string, ema
 			LastLoginAt: &now,
 		},
 	}, nil
+}
+
+func (s *Service) ChangeCompanyUserPassword(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, currentPassword string, newPassword string) error {
+	currentPassword = strings.TrimSpace(currentPassword)
+	if currentPassword == "" {
+		return fmt.Errorf("current password is required")
+	}
+
+	newPassword = strings.TrimSpace(newPassword)
+	if newPassword == "" {
+		return fmt.Errorf("new password is required")
+	}
+
+	var (
+		passwordHash string
+		active       bool
+		status       string
+	)
+	err := s.db.QueryRow(ctx, `
+		SELECT COALESCE(password_hash, ''), active, status
+		FROM users
+		WHERE id = $1
+			AND company_id = $2
+		LIMIT 1
+	`, userID, companyID).Scan(&passwordHash, &active, &status)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrInvalidCredentials
+		}
+		return fmt.Errorf("find company user: %w", err)
+	}
+
+	if !active || status != "active" || passwordHash == "" || ComparePassword(passwordHash, currentPassword) != nil {
+		return ErrInvalidCredentials
+	}
+
+	if ComparePassword(passwordHash, newPassword) == nil {
+		return fmt.Errorf("new password must be different from current password")
+	}
+
+	nextHash, err := HashPassword(newPassword)
+	if err != nil {
+		return err
+	}
+
+	if _, err := s.db.Exec(ctx, `
+		UPDATE users
+		SET password_hash = $3, updated_at = now()
+		WHERE id = $1
+			AND company_id = $2
+	`, userID, companyID, nextHash); err != nil {
+		return fmt.Errorf("update company user password: %w", err)
+	}
+
+	return nil
 }
 
 func (s *Service) AuthenticateToken(token string) (TokenClaims, error) {
@@ -356,7 +404,6 @@ func (s *Service) SessionFromClaims(claims TokenClaims) SessionResponse {
 			Company: &CompanySession{
 				ID:     claims.CompanyID,
 				Name:   claims.CompanyName,
-				Slug:   claims.CompanySlug,
 				Plan:   claims.Plan,
 				Active: true,
 			},
@@ -674,6 +721,7 @@ func (s *Service) CreateCompanyUser(ctx context.Context, companyID uuid.UUID, in
 	item.ID = userID.String()
 	item.CompanyID = dbCompanyID.String()
 	item.LastLoginAt = timePointer(lastLoginAt)
+
 	return item, nil
 }
 
@@ -706,32 +754,17 @@ func normalizeEmail(value string) string {
 	return strings.ToLower(strings.TrimSpace(value))
 }
 
+var nonSlugChars = regexp.MustCompile(`[^a-z0-9]+`)
+
 func normalizeSlug(value string) string {
 	value = strings.ToLower(strings.TrimSpace(value))
 	value = strings.NewReplacer(
-		"\u00e1", "a",
-		"\u00e0", "a",
-		"\u00e2", "a",
-		"\u00e3", "a",
-		"\u00e4", "a",
-		"\u00e9", "e",
-		"\u00e8", "e",
-		"\u00ea", "e",
-		"\u00eb", "e",
-		"\u00ed", "i",
-		"\u00ec", "i",
-		"\u00ee", "i",
-		"\u00ef", "i",
-		"\u00f3", "o",
-		"\u00f2", "o",
-		"\u00f4", "o",
-		"\u00f5", "o",
-		"\u00f6", "o",
-		"\u00fa", "u",
-		"\u00f9", "u",
-		"\u00fb", "u",
-		"\u00fc", "u",
-		"\u00e7", "c",
+		"\u00e1", "a", "\u00e0", "a", "\u00e2", "a", "\u00e3", "a", "\u00e4", "a",
+		"\u00e9", "e", "\u00e8", "e", "\u00ea", "e", "\u00eb", "e",
+		"\u00ed", "i", "\u00ec", "i", "\u00ee", "i", "\u00ef", "i",
+		"\u00f3", "o", "\u00f2", "o", "\u00f4", "o", "\u00f5", "o", "\u00f6", "o",
+		"\u00fa", "u", "\u00f9", "u", "\u00fb", "u", "\u00fc", "u",
+		"\u00e7", "c", "\u00f1", "n",
 	).Replace(value)
 	value = nonSlugChars.ReplaceAllString(value, "-")
 	return strings.Trim(value, "-")

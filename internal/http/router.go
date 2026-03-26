@@ -57,7 +57,7 @@ func NewRouter(deps Dependencies) *fiber.App {
 			return isAllowedOrigin(origin, deps.AllowedOrigins)
 		},
 		AllowMethods:  "GET,POST,PUT,PATCH,DELETE,OPTIONS",
-		AllowHeaders:  "Origin, Content-Type, Accept, Authorization, X-Company-ID, X-Niche-ID, X-User-ID, X-User-Role",
+		AllowHeaders:  "Origin, Content-Type, Accept, Authorization, X-Company-ID, X-Niche-ID, X-User-ID, X-User-Role, X-Collaborator-ID",
 		ExposeHeaders: "X-Request-ID",
 	}))
 
@@ -65,7 +65,8 @@ func NewRouter(deps Dependencies) *fiber.App {
 	authHandler := handlers.NewAuthHandler(deps.AuthService)
 	systemHandler := handlers.NewSystemHandler(deps.AuthService)
 	adsHandler := handlers.NewAdsHandler(deps.DB)
-	collaboratorsHandler := handlers.NewCollaboratorsHandler(deps.DB)
+	collaboratorsHandler := handlers.NewCollaboratorsHandler(deps.DB, deps.SyncService, deps.Logger)
+	collaboratorHandler := handlers.NewCollaboratorHandler(deps.DB)
 	dashboardHandler := handlers.NewDashboardHandler(deps.DB, deps.UTMifyClient, deps.Cache)
 	adObjectsHandler := handlers.NewAdObjectsHandler(deps.DB, deps.Cache, deps.UTMifyClient)
 	syncHandler := handlers.NewSyncHandler(deps.SyncService)
@@ -86,12 +87,25 @@ func NewRouter(deps Dependencies) *fiber.App {
 
 		company := api.Group("", middleware.RequireCompanyContext(deps.AuthService))
 		company.Post("/sync/today", syncHandler.SyncToday)
+		company.Post("/auth/change-password", authHandler.ChangeCompanyPassword)
 		company.Get("/ads", adsHandler.List)
 		company.Get("/ads/summary", adsHandler.Summary)
-		company.Get("/collaborators", collaboratorsHandler.List)
-		company.Post("/collaborators", collaboratorsHandler.Create)
-		company.Get("/collaborators/:id/commissions", collaboratorsHandler.MonthlyCommissions)
+		// Collaborator management – admin only
+		adminOnly := middleware.RequireAdmin()
+		company.Get("/collaborators", adminOnly, collaboratorsHandler.List)
+		company.Post("/collaborators", adminOnly, collaboratorsHandler.Create)
+		company.Put("/collaborators/:id", adminOnly, collaboratorsHandler.Update)
+		company.Delete("/collaborators/:id", adminOnly, collaboratorsHandler.Delete)
+		company.Get("/collaborators/dashboard/:dashboardId", adminOnly, collaboratorsHandler.ListByDashboard)
+		company.Put("/collaborators/dashboard/:dashboardId/:collaboratorId", adminOnly, collaboratorsHandler.UpdateDashboardCommission)
+		company.Get("/collaborators/dashboard/:dashboardId/access", adminOnly, collaboratorsHandler.GetDashboardAccess)
+		company.Put("/collaborators/dashboard/:dashboardId/:collaboratorId/access", adminOnly, collaboratorsHandler.SetDashboardAccess)
+		company.Get("/collaborators/:id/commissions", adminOnly, collaboratorsHandler.MonthlyCommissions)
+		company.Get("/collaborator/me", collaboratorHandler.Me)
+		company.Get("/collaborator/me/history", collaboratorHandler.MeHistory)
+		company.Get("/dashboard/list", dashboardHandler.List)
 		company.Get("/dashboard/summary", dashboardHandler.Summary)
+		company.Get("/dashboard/history", dashboardHandler.History)
 		company.Get("/ads/objects", adObjectsHandler.List)
 	}
 

@@ -62,15 +62,14 @@ func (h *AuthHandler) LoginSystem(c *fiber.Ctx) error {
 
 func (h *AuthHandler) LoginCompany(c *fiber.Ctx) error {
 	var request struct {
-		CompanySlug string `json:"company_slug"`
-		Email       string `json:"email"`
-		Password    string `json:"password"`
+		Email    string `json:"email"`
+		Password string `json:"password"`
 	}
 	if err := c.BodyParser(&request); err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid request body")
 	}
 
-	session, err := h.authService.LoginCompanyAdmin(c.Context(), request.CompanySlug, request.Email, request.Password)
+	session, err := h.authService.LoginCompanyUser(c.Context(), request.Email, request.Password)
 	if err != nil {
 		return mapAuthError(err)
 	}
@@ -86,6 +85,33 @@ func (h *AuthHandler) Me(c *fiber.Ctx) error {
 	}
 
 	return c.JSON(session)
+}
+
+func (h *AuthHandler) ChangeCompanyPassword(c *fiber.Ctx) error {
+	scope := middleware.GetCompanyContext(c)
+	if scope.UserID == nil {
+		return fiber.NewError(fiber.StatusUnauthorized, "usuario autenticado nao encontrado")
+	}
+
+	var request struct {
+		CurrentPassword string `json:"current_password"`
+		NewPassword     string `json:"new_password"`
+	}
+	if err := c.BodyParser(&request); err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid request body")
+	}
+
+	if err := h.authService.ChangeCompanyUserPassword(
+		c.Context(),
+		scope.CompanyID,
+		*scope.UserID,
+		request.CurrentPassword,
+		request.NewPassword,
+	); err != nil {
+		return mapAuthError(err)
+	}
+
+	return c.JSON(fiber.Map{"ok": true})
 }
 
 func mapAuthError(err error) error {
